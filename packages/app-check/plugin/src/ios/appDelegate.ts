@@ -31,6 +31,34 @@ const methodInvocationLineMatcher =
 const fallbackInvocationLineMatcher =
   /-\s*\(BOOL\)\s*application:\s*\(UIApplication\s*\*\s*\)\s*\w+\s+didFinishLaunchingWithOptions:/g;
 
+// Matches the `didFinishLaunchingWithOptions` parameter label of a Swift AppDelegate. Used as a
+// fallback anchor for app delegates that no longer start React Native themselves — under the UIScene
+// life cycle (Expo SDK 58+) the window and `startReactNative` call live in `SceneDelegate.swift`.
+// NOTE: `mergeContents()` matches line by line, so this pattern must not span newlines.
+export const swiftDidFinishLaunchingAnchor: RegExp = /didFinishLaunchingWithOptions\s+\w+\s*:/;
+
+// Swift method signatures are frequently wrapped across several lines, so the brace that opens the
+// method body is not always on the anchor line. Returns the `mergeContents` offset (in lines) from
+// the anchor to just inside the body, or null when no body is found.
+export function getSwiftMethodBodyOffset(contents: string, anchor: RegExp): number | null {
+  const lines = contents.split('\n');
+  const anchorIndex = lines.findIndex(line => anchor.test(line));
+  if (anchorIndex === -1) {
+    return null;
+  }
+
+  // A Swift signature that wraps is still only a handful of lines; bail out rather than scanning
+  // into an unrelated method if this one has no body (e.g. a protocol requirement).
+  const maxLookahead = Math.min(lines.length, anchorIndex + 8);
+  for (let index = anchorIndex; index < maxLookahead; index++) {
+    if (/\{\s*$/.test(lines[index])) {
+      return index - anchorIndex + 1;
+    }
+  }
+
+  return null;
+}
+
 export function modifyObjcAppDelegate(contents: string): string {
   contents = preferQuotedAppCheckModuleImport(contents);
   // Add import
@@ -149,12 +177,26 @@ export function modifySwiftAppDelegate(contents: string): string {
 
   const methodInvocationLineMatcher = /(?:factory\.startReactNative\()/;
 
-  if (!methodInvocationLineMatcher.test(contents)) {
-    WarningAggregator.addWarningIOS(
-      '@react-native-firebase/app-check',
-      'Unable to determine correct insertion point in AppDelegate.swift. Skipping App Check addition.',
-    );
-    return contents;
+  // Under the UIScene life cycle (Expo SDK 58+) the app delegate no longer calls
+  // `startReactNative` — that moved to `SceneDelegate.swift` — so fall back to the start of
+  // `didFinishLaunchingWithOptions`. App Check must still be registered from the app delegate,
+  // before any scene connects.
+  let anchor: RegExp;
+  let offset: number;
+  if (methodInvocationLineMatcher.test(contents)) {
+    anchor = methodInvocationLineMatcher;
+    offset = 0;
+  } else {
+    const bodyOffset = getSwiftMethodBodyOffset(contents, swiftDidFinishLaunchingAnchor);
+    if (bodyOffset === null) {
+      WarningAggregator.addWarningIOS(
+        '@react-native-firebase/app-check',
+        'Unable to determine correct insertion point in AppDelegate.swift. Skipping App Check addition.',
+      );
+      return contents;
+    }
+    anchor = swiftDidFinishLaunchingAnchor;
+    offset = bodyOffset;
   }
 
   try {
@@ -162,8 +204,8 @@ export function modifySwiftAppDelegate(contents: string): string {
       tag: '@react-native-firebase/app-check',
       src: contents,
       newSrc: methodInvocationBlock,
-      anchor: methodInvocationLineMatcher,
-      offset: 0,
+      anchor,
+      offset,
       comment: '//',
     }).contents;
   } catch (_e) {
